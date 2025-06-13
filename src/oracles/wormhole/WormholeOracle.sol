@@ -5,6 +5,8 @@ import { Ownable } from "solady/auth/Ownable.sol";
 import { SafeTransferLib } from "solady/utils/SafeTransferLib.sol";
 
 import { IPayloadCreator } from "../../interfaces/IPayloadCreator.sol";
+
+import { LibAddress } from "../../libs/LibAddress.sol";
 import { MessageEncodingLib } from "../../libs/MessageEncodingLib.sol";
 
 import { BaseOracle } from "../BaseOracle.sol";
@@ -27,6 +29,8 @@ contract WormholeOracle is ChainMap, BaseOracle, WormholeVerifier {
     uint8 constant WORMHOLE_CONSISTENCY = 15;
 
     IWormhole public immutable WORMHOLE;
+
+    using LibAddress for address;
 
     constructor(address _owner, address _wormhole) payable ChainMap(_owner) WormholeVerifier(_wormhole) {
         WORMHOLE = IWormhole(_wormhole);
@@ -59,7 +63,7 @@ contract WormholeOracle is ChainMap, BaseOracle, WormholeVerifier {
      * @return refund If too much value has been sent, the excess will be returned to msg.sender.
      */
     function _submit(address source, bytes[] calldata payloads) internal returns (uint256 refund) {
-        bytes memory message = MessageEncodingLib.encodeMessage(bytes32(uint256(uint160(source))), payloads);
+        bytes memory message = MessageEncodingLib.encodeMessage(source.toIdentifier(), payloads);
 
         uint256 packageCost = WORMHOLE.messageFee();
         WORMHOLE.publishMessage{ value: packageCost }(0, message, WORMHOLE_CONSISTENCY);
