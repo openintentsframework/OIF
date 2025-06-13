@@ -8,23 +8,25 @@ import { IPayloadCreator } from "../interfaces/IPayloadCreator.sol";
 import { MandateOutput, MandateOutputEncodingLib } from "../libs/MandateOutputEncodingLib.sol";
 import { OutputVerificationLib } from "../libs/OutputVerificationLib.sol";
 
-import { BaseOracle } from "../oracles/BaseOracle.sol";
+import { IOracle } from "../interfaces/IOracle.sol";
 
 /**
  * @notice Base Output Settler implementing logic for settling outputs.
- * Does not support native coins.
- * This base output settler implements logic to work as both a PayloadCreator (for oracles) and as an oracle itself.
+ * @dev Does not support native coins.
+ * @dev This base output settler implements logic to work as both a PayloadCreator (for oracles) and as an oracle
+ * itself. The output settler can be used as an oracle for same-chain intents. This is achieved by setting the
+ * `localOracle` of the order to the output settler address.
  */
-abstract contract BaseOutputSettler is IPayloadCreator, BaseOracle {
+abstract contract BaseOutputSettler is IPayloadCreator, IOracle {
     error FillDeadline();
-    error FilledBySomeoneElse(bytes32 solver);
+    error AlreadyFilled(bytes32 orderId, bytes32 outputHash);
     error ZeroValue();
 
     /**
-     * @notice Sets outputs as filled by their solver identifier, such that outputs won't be filled twice.
+     * @notice Sets outputs as filled storing their payload hash, such that outputs won't be filled twice.
      * @dev Is not used for validating payloads, BaseOracle::_attestations is used instead.
      */
-    mapping(bytes32 orderId => mapping(bytes32 outputHash => bytes32 solver)) public filledOutputs;
+    mapping(bytes32 orderId => mapping(bytes32 outputHash => bytes32 payloadHash)) internal _fillRecords;
 
     /**
      * @notice Output has been filled.
@@ -38,13 +40,8 @@ abstract contract BaseOutputSettler is IPayloadCreator, BaseOracle {
      * @param orderId Input chain order identifier. Is used as is, not checked for validity.
      * @param output The given output to fill. Is expected to belong to a greater order identified by orderId
      * @param proposedSolver Solver identifier to be sent to input chain.
-     * @return actualSolver Solver that filled the order. Tokens are only collected if equal to proposedSolver.
      */
-    function _fill(
-        bytes32 orderId,
-        MandateOutput calldata output,
-        bytes32 proposedSolver
-    ) internal virtual returns (bytes32);
+    function _fill(bytes32 orderId, MandateOutput calldata output, bytes32 proposedSolver) internal virtual;
 
     /**
      * @notice Performs basic validation and fills output is unfilled.
@@ -60,32 +57,26 @@ abstract contract BaseOutputSettler is IPayloadCreator, BaseOracle {
      * @param output Given output to fill. Is expected to belong to a greater order identified by orderId
      * @param outputAmount Amount to fill after order evaluation. Will be instead of output.amount.
      * @param proposedSolver Solver identifier to be sent to input chain.
-     * @return bytes32 Solver that filled the order. Tokens are only collected if equal to proposedSolver.
      */
     function _fill(
         bytes32 orderId,
         MandateOutput calldata output,
         uint256 outputAmount,
         bytes32 proposedSolver
-    ) internal virtual returns (bytes32) {
+    ) internal virtual {
         if (proposedSolver == bytes32(0)) revert ZeroValue();
         OutputVerificationLib._isThisChain(output.chainId);
         OutputVerificationLib._isThisOutputSettler(output.settler);
 
         bytes32 outputHash = MandateOutputEncodingLib.getMandateOutputHash(output);
-        bytes32 existingSolver = filledOutputs[orderId][outputHash];
-        if (existingSolver != bytes32(0)) return existingSolver; // Early return if already solved.
-        // The above and below lines act as a local re-entry check.
-        filledOutputs[orderId][outputHash] = proposedSolver;
+        bytes32 existing = _fillRecords[orderId][outputHash];
 
-        // Set the output attestation as true. This allows the output settler to act as an oracle. Note that the payload
-        // contains the current timestamp. This timestamp needs to be collected from the event (or tx) to be able to
-        // reproduce the payload(hash)
-        bytes32 dataHash = keccak256(
+        if (existing != bytes32(0)) revert AlreadyFilled(orderId, outputHash);
+
+        bytes32 payloadHash = keccak256(
             MandateOutputEncodingLib.encodeFillDescription(proposedSolver, orderId, uint32(block.timestamp), output)
         );
-        _attestations[block.chainid][bytes32(uint256(uint160(address(this))))][bytes32(uint256(uint160(address(this))))][dataHash]
-        = true;
+        _fillRecords[orderId][outputHash] = payloadHash;
 
         // Storage has been set. Fill the output.
         address recipient = address(uint160(uint256(output.recipient)));
@@ -93,7 +84,6 @@ abstract contract BaseOutputSettler is IPayloadCreator, BaseOracle {
         if (output.call.length > 0) IOIFCallback(recipient).outputFilled(output.token, outputAmount, output.call);
 
         emit OutputFilled(orderId, proposedSolver, uint32(block.timestamp), output);
-        return proposedSolver;
     }
 
     // --- External Solver Interface --- //
@@ -104,16 +94,15 @@ abstract contract BaseOutputSettler is IPayloadCreator, BaseOracle {
      * @param orderId Input chain order identifier. Is used as is, not checked for validity.
      * @param output Given output to fill. Is expected to belong to a greater order identified by orderId.
      * @param proposedSolver Solver identifier to be sent to input chain.
-     * @return bytes32 Solver that filled the order. Tokens are only collected if equal to proposedSolver.
      */
     function fill(
         uint32 fillDeadline,
         bytes32 orderId,
         MandateOutput calldata output,
         bytes32 proposedSolver
-    ) external virtual returns (bytes32) {
+    ) external virtual {
         if (fillDeadline < block.timestamp) revert FillDeadline();
-        return _fill(orderId, output, proposedSolver);
+        _fill(orderId, output, proposedSolver);
     }
 
     // -- Batch Solving -- //
@@ -141,11 +130,8 @@ abstract contract BaseOutputSettler is IPayloadCreator, BaseOracle {
     ) external {
         if (fillDeadline < block.timestamp) revert FillDeadline();
 
-        bytes32 actualSolver = _fill(orderId, outputs[0], proposedSolver);
-        if (actualSolver != proposedSolver) revert FilledBySomeoneElse(actualSolver);
-
         uint256 numOutputs = outputs.length;
-        for (uint256 i = 1; i < numOutputs; ++i) {
+        for (uint256 i = 0; i < numOutputs; ++i) {
             _fill(orderId, outputs[i], proposedSolver);
         }
     }
@@ -169,29 +155,29 @@ abstract contract BaseOutputSettler is IPayloadCreator, BaseOracle {
     // --- IPayloadCreator --- //
 
     /**
-     * @notice Helper function to check whether a payload hash is valid.
-     * @param payloadHash keccak256 hash of the relevant payload.
-     * @return bool Whether or not the payload has been recorded as filled.
-     */
-    function _isPayloadValid(
-        bytes32 payloadHash
-    ) internal view virtual returns (bool) {
-        return _attestations[block.chainid][bytes32(uint256(uint160(address(this))))][bytes32(
-            uint256(uint160(address(this)))
-        )][payloadHash];
-    }
-
-    /**
-     * @notice Returns whether a set of payload hashes have been approved by this contract.
+     * @notice Check if a series of fill records are valid.
+     * @param fills Encoded fill records to validate
+     * @return bool Whether all fill records are valid
      */
     function arePayloadsValid(
-        bytes32[] calldata payloadHashes
-    ) external view returns (bool) {
-        uint256 numPayloads = payloadHashes.length;
-        bool accumulator = true;
-        for (uint256 i; i < numPayloads; ++i) {
-            accumulator = accumulator && _isPayloadValid(payloadHashes[i]);
+        bytes calldata fills
+    ) public view returns (bool) {
+        // Decode the opaque bytes into FillRecord array
+        FillRecord[] memory fillRecords = abi.decode(fills, (FillRecord[]));
+
+        uint256 numFills = fillRecords.length;
+        for (uint256 i; i < numFills; ++i) {
+            FillRecord memory fillRecord = fillRecords[i];
+            if (_fillRecords[fillRecord.orderId][fillRecord.outputHash] != fillRecord.payloadHash) return false;
         }
-        return accumulator;
+        return true;
+    }
+
+    // --- IOracle --- //
+
+    function efficientRequireProven(
+        bytes calldata proofSeries
+    ) external view {
+        if (!arePayloadsValid(proofSeries)) revert NotProven();
     }
 }
